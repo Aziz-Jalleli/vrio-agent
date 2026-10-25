@@ -1,0 +1,36 @@
+# One read-only ArchiMate MCP server on your Vrio project + a free local AI agent.
+services:
+  archimate-vrio:
+    build: .
+    restart: unless-stopped
+    ports: ["8001:8000"]
+    environment:
+      ARCHI_TOKENS: '{"${ARCHI_TOKEN}":{"client_id":"webui","tenant_id":"school","scopes":[]}}'
+      ARCHI_MODEL_PATH: /models/vrio.xml
+    volumes: ["./models:/models:ro"]
+    command: >
+      archimate-mcp -t streamable-http -H 0.0.0.0 -p 8000
+      --tls-terminated --trusted-proxy-cidrs 172.16.0.0/12
+      --allowed-hosts archimate-vrio:8000,localhost:8001,127.0.0.1:8001
+      --auth-type static --static-tokens-ref env://ARCHI_TOKENS
+      --token-audience archimate-mcp
+      --tools archimate_list_views,archimate_get_view,archimate_list_elements,archimate_list_relationships,archimate_get_element,archimate_find_elements,archimate_relationships_of,archimate_neighbors
+
+  ollama:
+    image: ollama/ollama
+    ports: ["11434:11434"]
+    volumes: ["ollama:/root/.ollama"]
+    environment:
+      OLLAMA_CONTEXT_LENGTH: 8192
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports: ["3000:8080"]
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes: ["openwebui:/app/backend/data"]
+    depends_on: [ollama, archimate-vrio]
+
+volumes:
+  ollama:
+  openwebui:
