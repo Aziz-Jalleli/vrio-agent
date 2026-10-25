@@ -98,11 +98,15 @@ async def main() -> None:
             )
 
         tool_routes: dict[str, str] = {}
+        tool_params: dict[str, set[str]] = {}
         ollama_tools: list[dict[str, Any]] = []
 
         for tool in listed.tools:
             exposed_name = f"vrio__{tool.name}"
             tool_routes[exposed_name] = tool.name
+            tool_params[tool.name] = set(
+                (tool.input_schema or {}).get("properties", {})
+            )
 
             ollama_tools.append({
                 "type": "function",
@@ -191,6 +195,21 @@ async def main() -> None:
                             arguments = {}
 
                     original_name = tool_routes.get(exposed_name)
+
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    if original_name:
+                        allowed = tool_params[original_name]
+                        dropped = [k for k in arguments if k not in allowed]
+                        if dropped:
+                            print(
+                                f"\n[Ignored arguments the tool does not "
+                                f"accept: {dropped}]"
+                            )
+                            arguments = {
+                                k: v for k, v in arguments.items()
+                                if k in allowed
+                            }
 
                     if not original_name:
                         result_text = (

@@ -21,7 +21,15 @@ services:
     ports: ["11434:11434"]
     volumes: ["ollama:/root/.ollama"]
     environment:
-      OLLAMA_CONTEXT_LENGTH: 8192
+      OLLAMA_CONTEXT_LENGTH: 4096
+      OLLAMA_KEEP_ALIVE: 30m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main

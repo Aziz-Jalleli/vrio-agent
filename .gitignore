@@ -1,0 +1,15 @@
+
+# Secrets and local configuration
+.env
+*.json
+!archimate_audit_context.json
+!billing_audit_report.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!composer.json
+!composer.lock
+
+# Python generated files
+__pycache__/
+*.py[cod]

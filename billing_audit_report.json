@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "customers_rows": 3,
+    "billing_rows": 3,
+    "issues_found": 2,
+    "issues_requiring_review": 1,
+    "proposed_corrections": 1
+  },
+  "issues": [
+    {
+      "type": "CUSTOMER_NAME_MISMATCH",
+      "source": "Billing",
+      "invoice_id": "INV001",
+      "customer_id": "C102",
+      "row": 2,
+      "billing_name": "Ahmed Benaly",
+      "customer_name": "Ahmed Ben Ali",
+      "proposed_action": "Use 'Ahmed Ben Ali' in the billing record if Customers is the approved source of truth.",
+      "action": "PROPOSE_CORRECTION",
+      "details": "Customer ID matches exactly, but the names differ."
+    },
+    {
+      "type": "MISSING_CUSTOMER_REFERENCE",
+      "source": "Billing",
+      "invoice_id": "INV003",
+      "customer_id": "C999",
+      "row": 4,
+      "action": "REVIEW_REQUIRED",
+      "details": "Billing record references a customer_id absent from Customers."
+    }
+  ],
+  "source_data_modified": false
+}
