@@ -1,1 +1,0 @@
-Put your exported project here as: vrio.xml  (Archi: File > Export > Model to Open Exchange File..., keep the default .xml name and rename it to vrio.xml)
