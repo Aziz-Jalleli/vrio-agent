@@ -1,4 +1,8 @@
-"""Billing data audit agent: Google Sheets + ArchiMate MCP + local Ollama -> PDF report.
+"""Billing data audit AGENT: Google Sheets + ArchiMate MCP + local Ollama -> PDF report.
+
+The LLM is an agent with tools: it lists the billing issues and decides which invoices to fix.
+Fixes are written to the Google Sheet (Billing.customer_name) using the name from Customers.
+The sheet must be shared with the service account as EDITOR.
 
 Expected Google Sheets tabs:
   Customers: customer_id, name, email
@@ -23,7 +27,7 @@ from xml.sax.saxutils import escape
 
 import gspread
 import requests
-import httpx  # NOTE: was "httpx2" in the original, which is not a real package
+import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -87,7 +91,51 @@ def read_google_sheets() -> tuple[list[dict], list[dict]]:
 
 
 # --------------------------------------------------------------------------- #
-# Deterministic audit (unchanged)
+# Write-back to Google Sheets (called only by the agent's fix tool)
+# --------------------------------------------------------------------------- #
+def apply_name_corrections(audit: dict, only_invoice: str | None = None) -> list[dict]:
+    """Write the Customers name into Billing.customer_name, ONLY for PROPOSE_CORRECTION issues
+    (customer_id matches exactly one Customers row). Everything else is left for a human."""
+    from gspread.utils import rowcol_to_a1
+
+    creds_path = Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json"))
+    if not creds_path.is_absolute():
+        creds_path = BASE_DIR / creds_path
+    client = gspread.service_account(filename=str(creds_path))
+    ws = client.open_by_key(os.getenv("GOOGLE_SHEET_ID", "").strip()).worksheet(
+        os.getenv("BILLING_TAB", "Billing"))
+
+    values = ws.get_all_values()  # one read, used to re-check each row before writing
+    header = [h.strip() for h in values[0]]
+    inv_col = header.index("invoice_id")
+    name_col = header.index("customer_name")
+
+    updates, changes = [], []
+    for issue in audit["issues"]:
+        if issue.get("action") != "PROPOSE_CORRECTION":
+            continue
+        if only_invoice and norm_id(issue.get("invoice_id")) != norm_id(only_invoice):
+            continue
+        row = issue["row"]  # 1-based sheet row
+        new_name = issue["customer_name"]
+        if row > len(values):
+            continue
+        current = values[row - 1]
+        # Safety: the row must still be the same invoice with the same old name
+        if norm(current[inv_col]) != (issue.get("invoice_id") or "") \
+                or norm(current[name_col]) != issue["billing_name"]:
+            continue
+        updates.append({"range": rowcol_to_a1(row, name_col + 1), "values": [[new_name]]})
+        changes.append({"invoice_id": issue.get("invoice_id"), "customer_id": issue["customer_id"],
+                        "row": row, "old_name": issue["billing_name"], "new_name": new_name})
+
+    if updates:
+        ws.batch_update(updates, value_input_option="RAW")
+    return changes
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic audit (detection only; it never writes)
 # --------------------------------------------------------------------------- #
 def audit_data(customers: list[dict], billing: list[dict]) -> dict:
     """Deterministic audit. Does not change source Google Sheets."""
@@ -228,9 +276,9 @@ async def get_architecture_context() -> dict:
     if not token:
         raise RuntimeError("Set ARCHI_TOKEN in .env to your ArchiMate MCP token.")
 
-    async with httpx.AsyncClient(
+    async with httpx2.AsyncClient(
         headers={"Authorization": f"Bearer {token}"},
-        timeout=httpx.Timeout(30.0, read=300.0),
+        timeout=httpx2.Timeout(30.0, read=300.0),
     ) as http_client:
         async with streamable_http_client(mcp_url, http_client=http_client) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
@@ -267,41 +315,137 @@ async def get_architecture_context() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Ollama
+# Ollama agent
 # --------------------------------------------------------------------------- #
-def ask_ollama(audit: dict, architecture: dict) -> str:
+AGENT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_billing_issues",
+        "description": "Return the billing data issues found in Google Sheets (type, invoice_id, customer_id, row, action).",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "fix_billing_customer_name",
+        "description": ("Correct the customer_name of ONE invoice in the Billing sheet using the name from the "
+                        "Customers sheet. Works only for CUSTOMER_NAME_MISMATCH issues; refuses anything else."),
+        "parameters": {"type": "object",
+                       "properties": {"invoice_id": {"type": "string", "description": "e.g. INV001"}},
+                       "required": ["invoice_id"]}}},
+]
+
+
+TOOL_NAMES = {t["function"]["name"] for t in AGENT_TOOLS}
+
+
+def extract_text_tool_calls(text: str) -> list[dict]:
+    """Small models often PRINT a tool call as JSON text instead of using the tool-call API.
+    Recover those calls so the agent still acts: {"name": ..., "parameters": {...}}."""
+    calls, decoder, i = [], json.JSONDecoder(), 0
+    while True:
+        j = text.find("{", i)
+        if j < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(text[j:])
+        except ValueError:
+            i = j + 1
+            continue
+        i = j + end
+        if isinstance(obj, dict) and obj.get("name") in TOOL_NAMES:
+            args = obj.get("parameters", obj.get("arguments", {}))
+            calls.append({"function": {"name": obj["name"], "arguments": args if isinstance(args, dict) else {}}})
+    return calls
+
+
+def unfixed_mismatches(audit: dict, attempted: set) -> list[str]:
+    done = {norm_id(c["invoice_id"]) for c in audit["corrections_applied"]}
+    return [i["invoice_id"] for i in audit["issues"]
+            if i.get("action") == "PROPOSE_CORRECTION" and i.get("invoice_id")
+            and norm_id(i["invoice_id"]) not in done and norm_id(i["invoice_id"]) not in attempted]
+
+
+def run_tool(name: str, args: dict, audit: dict) -> str:
+    """Executes a tool the LLM asked for. All safety checks live here, not in the prompt."""
+    if name == "list_billing_issues":
+        return json.dumps(audit["issues"], ensure_ascii=False)
+    if name == "fix_billing_customer_name":
+        inv = norm(args.get("invoice_id"))
+        if not inv:
+            return "Error: invoice_id is required."
+        if any(norm_id(c["invoice_id"]) == norm_id(inv) for c in audit["corrections_applied"]):
+            return f"{inv} was already corrected."
+        try:
+            changes = apply_name_corrections(audit, only_invoice=inv)
+        except Exception as exc:
+            return f"Error while writing to Google Sheets: {exc}"
+        if not changes:
+            return (f"Refused: {inv} has no safe automatic correction (not a name mismatch with a unique "
+                    "customer ID, or the sheet changed). Leave it for human review.")
+        audit["corrections_applied"].extend(changes)
+        return "Corrected in Google Sheets: " + json.dumps(changes, ensure_ascii=False)
+    return f"Unknown tool: {name}"
+
+
+def run_agent(audit: dict, architecture: dict) -> str:
     url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat").strip()
     model = os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip()
-    system_prompt = """You are an assistant auditing billing data for an enterprise architecture project.
-Use ONLY the audit JSON and ArchiMate MCP results supplied by the user. Explain each detected data issue and its likely architectural relevance. Use actual ArchiMate element names only when they appear in the MCP results. Do not invent model elements or relationships. Distinguish detected facts from hypotheses. A customer-name mismatch can be proposed for correction only if the customer ID uniquely matches one Customers row and that sheet is the configured source of truth. Missing or ambiguous references require human review. The audit code does not modify source data.
+    system_prompt = """You are an agent that audits and repairs billing data for an enterprise architecture project.
+You have two tools. Work in this order:
+1. Call list_billing_issues.
+2. For EVERY issue of type CUSTOMER_NAME_MISMATCH, call fix_billing_customer_name with its invoice_id.
+3. Never try to fix other issue types: they need human review.
+4. When all fixes are done, write the final report. Only state that something was corrected if a tool result confirmed it.
+Use ArchiMate element names only if they appear in the provided ArchiMate context. Do not invent elements.
 
-FORMAT: Reply in clean Markdown using exactly these section headings, in this order:
+FORMAT of the final report, clean Markdown with exactly these headings, in this order:
 ## Executive Summary
 ## Issue-by-Issue Actions
 ## Architecture Impact
 ## Recommended Next Steps
-Use short paragraphs and '-' bullet lists. Bold key terms with **double asterisks**. Do not use tables or code blocks."""
-    user_payload = {
-        "task": "Explain this billing audit and relate it to the actual ArchiMate model where the returned evidence supports the link. Give a concise summary, issue-by-issue actions, and architecture impact.",
-        "audit": audit,
-        "archimate_mcp_context": architecture,
-    }
-    response = requests.post(
-        url,
-        json={
-            "model": model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            "options": {"temperature": 0.1},
-        },
-        timeout=300,
-    )
-    response.raise_for_status()
-    body = response.json()
-    return body.get("message", {}).get("content", "No response content from Ollama.")
+Use short paragraphs and '-' bullets. Bold key terms with **double asterisks**. No tables or code blocks."""
+    arch_text = json.dumps(architecture.get("results", {}), ensure_ascii=False)[:6000]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Audit summary: " + json.dumps(audit["summary"]) +
+                                    "\n\nArchiMate MCP context:\n" + arch_text +
+                                    "\n\nStart now: audit, fix what is safe, then write the report."},
+    ]
+    listed_issues, attempted, nudges = False, set(), 0
+    for _ in range(12):
+        resp = requests.post(url, json={"model": model, "stream": False, "messages": messages,
+                                        "tools": AGENT_TOOLS,
+                                        "options": {"temperature": 0.1, "num_ctx": 8192}}, timeout=300)
+        resp.raise_for_status()
+        msg = resp.json()["message"]
+        messages.append(msg)
+        calls = msg.get("tool_calls") or extract_text_tool_calls(msg.get("content") or "")
+        if not calls:
+            # The model wants to stop. If it skipped its job, push it back (max 2 times).
+            pending = unfixed_mismatches(audit, attempted)
+            if nudges < 2 and (not listed_issues or pending):
+                nudges += 1
+                hint = ("You have not called any tool yet. Call list_billing_issues now."
+                        if not listed_issues else
+                        "These invoices still have unfixed name mismatches: " + ", ".join(pending) +
+                        ". Call fix_billing_customer_name for each one.")
+                print("  [agent] nudging the model to use its tools")
+                messages.append({"role": "user", "content": hint + " Use the tool-calling interface."})
+                continue
+            return msg.get("content") or "No response content from the model."
+        for call in calls:
+            fn = call.get("function", {})
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            name = fn.get("name", "")
+            print(f"  [agent] tool call: {name}({args})")
+            if name == "list_billing_issues":
+                listed_issues = True
+            if name == "fix_billing_customer_name":
+                attempted.add(norm_id(args.get("invoice_id")))
+            messages.append({"role": "tool", "tool_name": name, "content": run_tool(name, args, audit)})
+    return "The agent stopped after 10 steps without a final report."
 
 
 # --------------------------------------------------------------------------- #
@@ -526,8 +670,11 @@ def build_pdf_report(audit: dict, architecture: dict, explanation: str, pdf_path
 
     status_ok = summary["issues_found"] == 0
     status_text = ("No data issues detected." if status_ok else
-                   f"{summary['issues_found']} issue(s) detected. "
-                   "Source data was <b>not modified</b>; every correction needs approval.")
+                   f"{summary['issues_found']} issue(s) detected. " +
+                   (f"<b>{len(audit.get('corrections_applied', []))} billing name(s) were corrected</b> "
+                    "by the agent from the Customers sheet; all other issues need human review."
+                    if audit.get("corrections_applied") else
+                    "No correction was applied; every issue needs human review."))
     status_style = ParagraphStyle("status", parent=styles["body"], textColor=GREEN if status_ok else AMBER,
                                   backColor=GREEN_BG if status_ok else AMBER_BG,
                                   borderPadding=(6, 8, 6, 8), spaceBefore=4, spaceAfter=10)
@@ -560,7 +707,7 @@ def build_pdf_report(audit: dict, architecture: dict, explanation: str, pdf_path
     story.append(Paragraph("AI Analysis", styles["h1"]))
     story.append(HRFlowable(width="100%", thickness=0.6, color=RULE, spaceAfter=4))
     story.append(Paragraph(
-        "Generated by the local Ollama model from the audit results and the ArchiMate MCP context. "
+        "Generated by the local Ollama agent from the audit tools and the ArchiMate MCP context. "
         "Treat it as an explanation to verify, not as ground truth.", styles["note"]))
     story.append(Spacer(1, 4))
     story.extend(markdown_to_flowables(explanation, styles, mono))
@@ -596,6 +743,26 @@ def build_pdf_report(audit: dict, architecture: dict, explanation: str, pdf_path
         findings.setStyle(TableStyle(style_cmds))
         story.append(findings)
 
+    # ---- Corrections applied by the agent ----------------------------------
+    applied = audit.get("corrections_applied", [])
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Corrections applied by the agent", styles["h2"]))
+    if not applied:
+        story.append(Paragraph("None.", styles["body"]))
+    else:
+        rows = [[Paragraph(h, styles["cellb"]) for h in ("Invoice", "Customer ID", "Sheet row", "Old name", "New name")]]
+        for c in applied:
+            rows.append([Paragraph(escape(str(c[k])), styles["cell"])
+                         for k in ("invoice_id", "customer_id", "row", "old_name", "new_name")])
+        ctable = Table(rows, colWidths=[usable_width * w for w in (0.15, 0.17, 0.13, 0.275, 0.275)], repeatRows=1)
+        ctable.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+            ("GRID", (0, 0), (-1, -1), 0.4, RULE),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(ctable)
+
     # ---- Appendix: ArchiMate context ---------------------------------------
     story.append(Spacer(1, 12))
     tools = ", ".join(architecture.get("available_tools", [])) or "none"
@@ -624,6 +791,7 @@ def main() -> int:
     try:
         customers, billing = read_google_sheets()
         audit = audit_data(customers, billing)
+        audit["corrections_applied"] = []
         report_path = BASE_DIR / "billing_audit_report.json"
         report_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Audit complete: {audit['summary']['issues_found']} issue(s) found.")
@@ -635,8 +803,11 @@ def main() -> int:
         arch_path.write_text(json.dumps(architecture, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"Architecture context saved to: {arch_path}")
 
-        print("Asking local Ollama model to explain the results...\n")
-        explanation = ask_ollama(audit, architecture)
+        print("Starting the agent (it decides which fixes to apply)...\n")
+        explanation = run_agent(audit, architecture)
+        audit["source_data_modified"] = bool(audit["corrections_applied"])
+        (BASE_DIR / "billing_corrections_log.json").write_text(
+            json.dumps(audit["corrections_applied"], ensure_ascii=False, indent=2), encoding="utf-8")
         print(explanation)
         explanation_path = BASE_DIR / "billing_audit_explanation.md"
         explanation_path.write_text(explanation + "\n", encoding="utf-8")
@@ -646,7 +817,9 @@ def main() -> int:
         build_pdf_report(audit, architecture, explanation, pdf_path)
         print(f"PDF report saved to: {pdf_path}")
 
-        print("\nNo Google Sheets cells were changed. Review the report before applying any corrections.")
+        n = len(audit["corrections_applied"])
+        print(f"\n{n} Google Sheets cell(s) corrected by the agent (see billing_corrections_log.json)."
+              if n else "\nNo Google Sheets cells were changed.")
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

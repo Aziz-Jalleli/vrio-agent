@@ -14,7 +14,7 @@ services:
       --allowed-hosts archimate-vrio:8000,localhost:8001,127.0.0.1:8001
       --auth-type static --static-tokens-ref env://ARCHI_TOKENS
       --token-audience archimate-mcp
-      --tools archimate_list_views,archimate_get_view,archimate_list_elements,archimate_list_relationships,archimate_get_element,archimate_find_elements,archimate_relationships_of,archimate_neighbors
+      --tools archimate_add_connection_to_view,archimate_add_element,archimate_add_element_to_view,archimate_add_folder,archimate_add_relationship,archimate_create_view,archimate_delete_element,archimate_delete_relationship,archimate_element_types,archimate_elements_by_type,archimate_export_open_exchange,archimate_find_elements,archimate_get_element,archimate_get_relationship,archimate_get_view,archimate_import_open_exchange,archimate_ingest_model,archimate_ingest_to_kg,archimate_list_elements,archimate_list_folders,archimate_list_relationships,archimate_list_views,archimate_load,archimate_model_summary,archimate_move_to_folder,archimate_neighbors,archimate_new_model,archimate_relationship_types,archimate_relationships_of,archimate_save,archimate_update_element,archimate_update_relationship,archimate_validate_relationship
 
   ollama:
     image: ollama/ollama

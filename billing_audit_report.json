@@ -13,7 +13,7 @@
       "invoice_id": "INV001",
       "customer_id": "C102",
       "row": 2,
-      "billing_name": "Ahmed Benaly",
+      "billing_name": "Ahmed Benli",
       "customer_name": "Ahmed Ben Ali",
       "proposed_action": "Use 'Ahmed Ben Ali' in the billing record if Customers is the approved source of truth.",
       "action": "PROPOSE_CORRECTION",
@@ -29,5 +29,6 @@
       "details": "Billing record references a customer_id absent from Customers."
     }
   ],
-  "source_data_modified": false
+  "source_data_modified": false,
+  "corrections_applied": []
 }
